@@ -1,0 +1,159 @@
+# Default configuration for the RL-Guided Drift-Triggered Active Learning
+# Hybrid IDS thesis pipeline. Every script accepts --config and falls back
+# to this file. The top-level keys below are the ones read directly by the
+# CLI / core pipeline; the trailing supplementary blocks configure details
+# (preprocessing internals, baseline model sizes, per-detector thresholds)
+# that aren't part of the required top-level schema but still need sane,
+# explicit defaults.
+
+dataset: ciciot2023          # "unsw" | "cicids" | "ciciot2023" | "auto" (auto-detect from raw_dir contents)
+raw_dir: data/raw/ciciot2023/CIC_IOT_Dataset2023_CSV/CSV
+output_dir: results_ciciot2023_balanced_test
+
+test_size: 0.3
+random_state: 42
+max_samples: 50000           # hard cap on rows loaded; set to null to load everything
+batch_size: 1000             # rolling-window size used for prequential/streaming metrics
+
+# Label budgets (as a fraction of the stream) swept across both the active
+# learning strategy comparison and the label-budget-consuming hybrid IDS
+# arms (drift-triggered AL hybrid, RL-guided hybrid).
+active_learning_budgets: [0.01, 0.05, 0.10, 0.25, 1.0]
+
+drift_detector: adwin        # "adwin" | "page_hinkley" | "both"
+
+# How the train/evaluation split is constructed. "stratified_random" (the
+# shuffled split already produced by preprocess_pipeline) is the standard
+# choice for an initial thesis run. "chronological" uses arrival order
+# instead (needed for the streaming/drift experiments regardless of this
+# setting — see src/preprocessing.py). "category_holdout" trains on a
+# subset of attack categories and tests on categories never seen during
+# training (see results/tables/unseen_attack_metrics.csv, always produced
+# by run_rl_hybrid_experiment.py as a dedicated generalization check
+# alongside whatever this is set to). "file_holdout" trains/tests on
+# disjoint source files when file-level provenance is available.
+split_strategy: stratified_random
+
+# Only used when dataset: ciciot2023 (the raw per-category CSV export has
+# no inline label). Controls HOW the max_samples budget is spread across
+# the 34 category folders — see src/data_loader.py::_load_ciciot2023 for
+# full detail on each mode.
+sampling:
+  # "original_distribution": proportional to each file's true size — keeps
+  #     the dataset's real ~2.35% benign / DDoS-dominated imbalance. Only
+  #     useful for showing "what does naive real-traffic sampling look
+  #     like"; a model trained on it barely sees benign or rare-attack
+  #     examples.
+  # "balanced_binary" (default here): benign:attack controlled via
+  #     benign_attack_ratio, with the attack side spread across every
+  #     attack category (capped at per_attack_category_cap each) instead of
+  #     being dominated by whichever DDoS variant has the most files.
+  # "category_balanced": up to per_attack_category_cap rows from EVERY
+  #     category including benign — for multiclass/category-aware analysis.
+  mode: balanced_binary
+  max_samples: 50000
+  benign_attack_ratio: 1.0
+  per_attack_category_cap: 2000
+  preserve_attack_diversity: true
+
+# Synthetic fallback is for pipeline smoke-testing ONLY. Default is false:
+# a thesis run MUST use real data, and the pipeline will stop with a clear
+# error if raw_dir has no usable CSVs and this is false. Only flip to true
+# for local code testing when you don't have UNSW-NB15/CICIDS2017 handy —
+# every output row/table/report from such a run is marked synthetic_data=true
+# and the report prints a large warning that it is not a valid thesis result.
+allow_synthetic_fallback: false
+
+# Lightweight RL controller (tabular Q-learning-lite, NOT deep RL).
+rl:
+  epsilon: 0.1
+  alpha: 0.1
+  gamma: 0.9
+  false_positive_penalty: -2
+  false_negative_penalty: -6
+  correct_attack_reward: 5
+  correct_benign_reward: 1
+  label_query_cost: -0.5
+  model_update_cost: -0.1
+
+# --------------------------------------------------------------------------
+# Supplementary settings — not part of the required top-level schema above,
+# but needed to run the rest of the pipeline. All have defaults in code, so
+# omitting any of these is safe.
+# --------------------------------------------------------------------------
+
+processed_dir: data/processed
+synthetic_rows: 20000
+synthetic_features: 20
+
+preprocessing:
+  scale: true
+  # Columns dropped outright if present (ids, flow ids, ips, timestamps, ports).
+  id_like_patterns:
+    ["id", "flow_id", "src_ip", "dst_ip", "source_ip", "destination_ip", "timestamp", "stime", "ltime",
+     "src_port", "dst_port", "source_port", "destination_port"]
+  max_onehot_cardinality: 20
+
+baseline_models:
+  n_estimators: 200
+  use_xgboost: true
+  use_lightgbm: true
+
+stream:
+  use_adaptive_random_forest: true
+
+drift_detection:
+  adwin_delta: 0.002
+  page_hinkley_threshold: 50
+  page_hinkley_min_instances: 30
+
+active_learning:
+  uncertainty_margin_threshold: 0.15
+  strategies: ["random", "uncertainty", "drift_triggered_uncertainty"]
+  # Unconditional labeled seed set before any strategy-driven query decision
+  # is trusted — prevents a freshly-initialized model's meaningless/overfit
+  # confidence from starving the query strategy immediately.
+  warmup_fraction: 0.01
+  warmup_min: 100
+
+hybrid_ids:
+  # Fraction of the chronological stream reserved to train the rule layer
+  # and the static-ML arm; every arm is *evaluated* on the rest. Deliberately
+  # small (vs. the 70/30 baseline split) so the evaluation window still
+  # contains any concept drift instead of it being fully absorbed by an
+  # unrestricted offline pretraining phase.
+  rule_train_fraction: 0.2
+  rule_layer:
+    # Rule layer is a *simulated* signature engine: a confidence-thresholded
+    # shallow decision tree standing in for a Snort/Suricata-style engine's
+    # coverage of known attack patterns. It is NOT a real IDS.
+    confidence_threshold: 0.97
+    # For datasets with a multiclass attack-category column (attack_cat /
+    # named Label), the rule layer is only trained to recognize the top-K
+    # most frequent attack categories in the training prefix — rows from
+    # rarer/novel categories never enter its own training set.
+    known_categories_top_k: 5
+
+# Dedicated category_holdout generalization check (results/tables/unseen_attack_metrics.csv):
+# trains 4 methods (Static ML only, Drift-aware adaptive ML, Drift-triggered
+# active learning, RL-guided hybrid) on benign + `1 - held_out_fraction` of
+# attack categories, tests all 4 on the SAME benign-holdout + the attack
+# categories withheld entirely from training.
+unseen_attack_experiment:
+  held_out_fraction: 0.3
+  benign_test_fraction: 0.3
+  budget_fraction: 0.1
+
+# RL reward-sensitivity grid search (results/tables/rl_reward_tuning.csv).
+# Off by default -- a 27-combination sweep is a deliberate re-tuning pass,
+# not part of every routine pipeline run. Flip enabled: true to regenerate
+# rl_reward_tuning.csv, pick the composite_score-best row, hand-copy its
+# false_positive_penalty/false_negative_penalty/label_query_cost into the
+# rl: block above, then flip this back to false for the final run.
+rl_reward_tuning:
+  enabled: false
+  false_positive_penalty: [-2, -4, -6]
+  false_negative_penalty: [-6, -8, -10]
+  label_query_cost: [-0.5, -1.0, -2.0]
+  sample_size: 12000
+  budget_fraction: 0.1
