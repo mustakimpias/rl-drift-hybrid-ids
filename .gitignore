@@ -1,61 +1,47 @@
-# Raw datasets — never uploaded (size + licensing constraints)
-data/raw/
-
-# Python environments
-.venv/
-venv/
-env/
-
-# Python cache/bytecode
+﻿# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# Logs / temp / cache
-*.log
-*.tmp
-*.bak
-.cache/
-tmp/
-temp/
+# Virtual environments
+.venv/
+venv/
+env/
 
-# Experiment outputs (regenerable by rerunning the pipeline — never edited by hand)
-outputs/
-results*/
+# Claude local files
+.claude/
+.claude
+.claude.json
+CLAUDE.md
 
-# Archives
+# Raw / large datasets
+data/raw/
 *.zip
 *.tar
 *.gz
 *.7z
 *.rar
 
-# Model / serialized-object binaries
+# Logs / temp
+*.log
+*.tmp
+*.bak
+.cache/
+tmp/
+temp/
+outputs/
+results*/
+
+# Model binaries
 *.pkl
 *.joblib
 *.h5
 *.pt
 *.pth
 
-# OS / editor cruft
-.DS_Store
-Thumbs.db
+# IDE / OS
 .vscode/
 .idea/
-
-# Claude Code local files
-.claude/
-.claude
-.claude.json
-CLAUDE.md
-
-# --------------------------------------------------------------------------
-# Intentionally NOT ignored (kept tracked, if present):
-#   configs/  scripts/  src/  thesis_overleaf_assets/  chapters/
-#   frontmatter/  Main.tex  bibliography.bib  README.md  requirements.txt
-#   CODE_AVAILABILITY.md  OVERLEAF_COMPILE_NOTES.md
-#   VALIDITY_MITIGATION_ACTIONS.md  BIBLIOGRAPHY_AUDIT.md
-#   REVIEWER_SUGGESTION_UPDATES.md
-# None of the patterns above match these paths.
-# --------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
