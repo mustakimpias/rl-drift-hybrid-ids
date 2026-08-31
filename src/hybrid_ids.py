@@ -190,6 +190,54 @@ def _stratified_category_prefix_indices(
     return np.sort(selected_arr)
 
 
+def build_rule_train_stream_split(
+    X_train_chrono: np.ndarray, y_train_chrono: np.ndarray,
+    X_test_chrono: np.ndarray, y_test_chrono: np.ndarray,
+    rule_train_fraction: float,
+    seed: int,
+    category_train_chrono: np.ndarray | None = None,
+    category_test_chrono: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Combine train+test chronological arrays into one stream, then split
+    into a small rule/static-ML training prefix (stratified by attack
+    category — or by binary label if no category column exists — NOT a
+    chronological cut; see run_hybrid_comparison's module-level docstring
+    for why) plus the remaining evaluation stream.
+
+    Extracted so run_hybrid_comparison, run_rl_reward_tuning, and the
+    strict-causal experiment script (scripts/run_strict_causal_experiment.py)
+    all reproduce byte-identical splits given the same seed/config, instead
+    of three copies of this logic silently drifting apart.
+    """
+    combined_X = np.concatenate([X_train_chrono, X_test_chrono], axis=0)
+    combined_y = np.concatenate([y_train_chrono, y_test_chrono], axis=0)
+    combined_category = None
+    if category_train_chrono is not None and category_test_chrono is not None:
+        combined_category = np.concatenate([category_train_chrono, category_test_chrono], axis=0)
+
+    n_total = len(combined_X)
+    target_train = max(1, min(n_total - 1, int(round(n_total * rule_train_fraction))))
+    rng = np.random.default_rng(seed)
+    if combined_category is not None:
+        train_idx = _stratified_category_prefix_indices(combined_category, target_train, rng)
+    else:
+        train_idx = stratified_warmup_indices(combined_y, np.arange(n_total), target_train, rng, balanced=False)
+    train_idx_set = set(train_idx.tolist())
+    stream_idx = np.array([i for i in range(n_total) if i not in train_idx_set])
+
+    X_rule_train, y_rule_train = combined_X[train_idx], combined_y[train_idx]
+    X_stream, y_stream = combined_X[stream_idx], combined_y[stream_idx]
+    category_rule_train = combined_category[train_idx] if combined_category is not None else None
+
+    return {
+        "X_rule_train": X_rule_train, "y_rule_train": y_rule_train,
+        "category_rule_train": category_rule_train,
+        "X_stream": X_stream, "y_stream": y_stream,
+        "train_idx": train_idx, "stream_idx": stream_idx,
+        "n_total": n_total,
+    }
+
+
 @dataclass
 class ArmResult:
     name: str
@@ -677,6 +725,427 @@ def run_rl_guided_hybrid(
 
 
 # --------------------------------------------------------------------------
+# Arm: Drift-triggered active-learning hybrid, strict-causal variant
+# --------------------------------------------------------------------------
+
+def run_drift_triggered_al_hybrid_strict_causal(
+    rule_layer: RuleBasedLayer,
+    X_stream: np.ndarray, y_stream: np.ndarray, feature_names: list[str],
+    label_budget_fraction: float = 0.15,
+    uncertainty_margin_threshold: float = 0.15,
+    drift_window: int = 50,
+    detector_type: str = "adwin",
+    adwin_delta: float = 0.002,
+    page_hinkley_threshold: float = 50,
+    page_hinkley_min_instances: int = 30,
+    batch_size: int = 1000,
+    warmup_fraction: float = 0.01,
+    warmup_min: int = 100,
+    seed: int = 42,
+) -> ArmResult:
+    """Strict-causal counterpart of run_drift_triggered_al_hybrid: identical
+    routing/query policy, but drift-detector updates for samples whose label
+    was NOT queried use only the unsupervised (prediction-uncertainty)
+    signal instead of the true-label error indicator — see
+    stream_utils.run_budgeted_stream(strict_causal=True).
+    """
+    matched_mask, rule_preds = rule_layer.predict(X_stream)
+    with timer() as infer_t:
+        result, _ = run_budgeted_stream(
+            model_factory=_fresh_river_model,
+            X=X_stream, y=y_stream, feature_names=feature_names,
+            strategy="drift_triggered_uncertainty",
+            label_budget_fraction=label_budget_fraction,
+            detector_type=detector_type, adwin_delta=adwin_delta,
+            page_hinkley_threshold=page_hinkley_threshold, page_hinkley_min_instances=page_hinkley_min_instances,
+            drift_window=drift_window, batch_size=batch_size,
+            warmup_fraction=warmup_fraction, warmup_min=warmup_min,
+            rule_matched_mask=matched_mask, rule_preds=rule_preds,
+            seed=seed, strict_causal=True,
+        )
+
+    coverage = float(np.mean(matched_mask))
+    precision, recall = rule_layer_precision_recall(matched_mask, rule_preds, y_stream)
+    return ArmResult(
+        name="drift_triggered_al_hybrid_strict_causal",
+        predictions=result.predictions,
+        metrics=result.metrics,
+        train_time_sec=0.0,
+        inference_time_sec=infer_t["seconds"],
+        label_query_percentage=result.label_query_percentage,
+        drift_count=result.drift_count,
+        rule_layer_coverage=coverage * 100,
+        ml_layer_coverage=(1 - coverage) * 100,
+        feedback_mode="budgeted_active_learning_strict_causal",
+        rule_precision=precision,
+        rule_recall=recall,
+        rule_layer_mode=rule_layer.describe(),
+        extra={
+            "queried_count": len(result.queried_labels),
+            "queried_attack_count": result.queried_attack_count,
+            "queried_benign_count": result.queried_benign_count,
+            "unsupervised_drift_count": result.unsupervised_drift_count,
+        },
+    )
+
+
+# --------------------------------------------------------------------------
+# Arm: RL-guided hybrid, strict-causal variant
+#
+# See run_rl_guided_hybrid's docstring for the shared routing/action design.
+# This function differs from it ONLY in what happens to the true label after
+# an action has been chosen — see the docstring below for the exact gating.
+# The archived/original run_rl_guided_hybrid above is left completely
+# unmodified so prior results remain reproducible; this is a parallel,
+# separately-invoked implementation, not a patched version of it.
+# --------------------------------------------------------------------------
+
+def run_rl_guided_hybrid_strict_causal(
+    rule_layer: RuleBasedLayer,
+    X_stream: np.ndarray, y_stream: np.ndarray, feature_names: list[str],
+    rl_config: dict[str, Any],
+    label_budget_fraction: float = 0.15,
+    detector_type: str = "adwin",
+    adwin_delta: float = 0.002,
+    page_hinkley_threshold: float = 50,
+    page_hinkley_min_instances: int = 30,
+    drift_recency_window: int = 50,
+    metrics_window: int = 200,
+    warmup_fraction: float = 0.01,
+    warmup_min: int = 100,
+    seed: int = 42,
+    disable_threshold_adjustment: bool = False,
+) -> tuple[ArmResult, RLController, pd.DataFrame]:
+    """Strict-causal counterpart of run_rl_guided_hybrid.
+
+    `disable_threshold_adjustment` is a diagnostic-only ablation switch (see
+    STRICT_CAUSAL_RL_FAILURE_DIAGNOSTICS.md): when True, ACTION_ADJUST_THRESHOLD
+    can still be *selected* by the controller (so the action distribution and
+    Q-learning dynamics are unaffected), but its real-world effect — actually
+    moving `decision_threshold` — is suppressed. This isolates "does the
+    threshold-raising behavior itself hurt F1" from "does the controller
+    choose to raise the threshold too often."
+
+    Relative to run_rl_guided_hybrid, every consumer of the true label other
+    than (a) the classifier update — already correctly gated on `queried` in
+    the original — and (b) the evaluator's own final metrics (computed once,
+    after the whole run, exactly like the original) is now also gated on
+    `queried`:
+
+      - Reward: controller.compute_reward(true_label, ...) is called ONLY
+        when queried. Otherwise controller.compute_proxy_reward() (a fixed
+        0.0 that never touches true_label) is used instead, and a normal
+        Q-table transition is still recorded with that proxy reward so
+        Q-learning bookkeeping (visitation counts, epsilon decay) stays
+        intact across every step, not just queried ones.
+      - Drift detection: a supervised DriftDetector (fed the true-label
+        error indicator) is updated ONLY when queried or during warm-up.
+        A second, independent unsupervised DriftDetector (fed prediction
+        uncertainty, which never requires a label) is updated on every
+        single step. The "drift recently" flag consulted by state
+        discretization and by ACTION_UPDATE_IF_DRIFT is the OR of both
+        detectors' recency windows, so drift-awareness doesn't silently
+        degrade to "only aware when we happened to query."
+      - recent_f1 / recent_fpr (part of the RL state): computed only from
+        the subsequence of (true_label, prediction) pairs where true_label
+        was actually queried — never from an unqueried sample's hidden
+        label. This makes these two state features a biased, budget-sized
+        window rather than the true rolling performance (a known, reported
+        limitation — see STRICT_CAUSAL_AUDIT_REPORT.md), but they are never
+        computed from information the algorithm would not really have.
+
+    Returns (ArmResult, RLController, trace_df): trace_df is a per-instance
+    audit log — one row per sample in X_stream (both warm-up and evaluated)
+    — with exactly the columns needed to check every rule in the strict
+    causal protocol (stream_index, routed_to_rule_layer/ml_layer,
+    y_true_available_to_algorithm, queried, warmup_label, action,
+    classifier_updated, q_table_updated, supervised_reward_used,
+    unsupervised_or_zero_reward_used, supervised_drift_updated,
+    unsupervised_drift_updated, recent_f1_fpr_updated, prediction,
+    final_metric_label_available_to_evaluator).
+    """
+    set_seed(seed)
+    rng = np.random.default_rng(seed)
+    ml_model = _fresh_river_model()
+    controller = RLController(rl_config=rl_config, seed=seed)
+    supervised_detector = DriftDetector(
+        detector_type=detector_type, adwin_delta=adwin_delta,
+        page_hinkley_threshold=page_hinkley_threshold, page_hinkley_min_instances=page_hinkley_min_instances,
+    )
+    unsupervised_detector = DriftDetector(
+        detector_type=detector_type, adwin_delta=adwin_delta,
+        page_hinkley_threshold=page_hinkley_threshold, page_hinkley_min_instances=page_hinkley_min_instances,
+    )
+    n = len(X_stream)
+    budget_total = max(1, int(round(label_budget_fraction * n)))
+    matched_mask, rule_preds = rule_layer.predict(X_stream)
+
+    eligible_idx_all = np.where(~matched_mask)[0]
+    warmup_target = compute_warmup_size(n, warmup_fraction, warmup_min, budget_cap=budget_total)
+    warmup_idx = stratified_warmup_indices(y_stream, eligible_idx_all, warmup_target, rng)
+    warmup_idx_set = set(warmup_idx.tolist())
+
+    trace_rows: list[dict[str, Any]] = []
+
+    # Warm-up: a genuinely labeled seed set (train-only, excluded from
+    # evaluated predictions/metrics below, exactly as in run_rl_guided_hybrid)
+    # — these labels ARE legitimately available to the algorithm by
+    # construction, so no gating applies here.
+    for i in sorted(warmup_idx_set):
+        x_dict = row_to_dict(X_stream[i], feature_names)
+        ml_model.learn_one(x_dict, int(y_stream[i]))
+        trace_rows.append({
+            "stream_index": int(i),
+            "routed_to_rule_layer": bool(matched_mask[i]),
+            "routed_to_ml_layer": not bool(matched_mask[i]),
+            "y_true_available_to_algorithm": True,
+            "queried": False,
+            "warmup_label": True,
+            "action": None,
+            "classifier_updated": True,
+            "q_table_updated": False,
+            "supervised_reward_used": False,
+            "unsupervised_or_zero_reward_used": False,
+            "supervised_drift_updated": False,
+            "unsupervised_drift_updated": False,
+            "recent_f1_fpr_updated": False,
+            "prediction": None,
+            "final_metric_label_available_to_evaluator": True,
+            "uncertainty": None,
+            "recent_f1": None,
+            "recent_fpr": None,
+            "decision_threshold": None,
+            "drift_flag_for_state": None,
+        })
+    budget_remaining = budget_total - len(warmup_idx_set)
+
+    decision_threshold = 0.5
+    if warmup_idx_set:
+        warmup_probs = np.array([
+            uncertainty_from_proba(ml_model.predict_proba_one(row_to_dict(X_stream[i], feature_names)))[0]
+            for i in sorted(warmup_idx_set)
+        ])
+        warmup_labels = np.array([int(y_stream[i]) for i in sorted(warmup_idx_set)])
+        decision_threshold = tune_decision_threshold(warmup_probs, warmup_labels)
+        logger.info(
+            "RL-guided hybrid (strict-causal): tuned starting decision threshold from warm-up set: %.2f",
+            decision_threshold,
+        )
+
+    steps_since_drift_supervised = 10**9
+    steps_since_drift_unsupervised = 10**9
+    recent_true_queried: list[int] = []
+    recent_pred_queried: list[int] = []
+
+    from sklearn.metrics import f1_score
+
+    def _recent_f1_fpr() -> tuple[float, float]:
+        if not recent_true_queried:
+            return 1.0, 0.0
+        f1 = f1_score(recent_true_queried, recent_pred_queried, zero_division=0)
+        fp = sum(1 for t, p in zip(recent_true_queried, recent_pred_queried) if t == 0 and p == 1)
+        neg = sum(1 for t in recent_true_queried if t == 0)
+        fpr = fp / neg if neg > 0 else 0.0
+        return f1, fpr
+
+    preds: list[int] = []
+    queried_flags: list[bool] = [True] * len(warmup_idx_set)
+    remaining_idx = [i for i in range(n) if i not in warmup_idx_set]
+    action_trace: list[dict[str, Any]] = []
+
+    with timer() as infer_t:
+        for i in remaining_idx:
+            x_dict = row_to_dict(X_stream[i], feature_names)
+            proba = ml_model.predict_proba_one(x_dict)
+            p_attack, uncertainty = uncertainty_from_proba(proba)
+            ml_pred_monitor = 1 if p_attack >= 0.5 else 0
+
+            # --- Everything up to and including action selection uses only
+            # information available before this sample's true label is
+            # looked at: uncertainty from features only, drift flags from
+            # detector state as of the *previous* sample, recent_f1/fpr from
+            # the queried-only history so far. ---
+            drift_flag_for_state = (
+                steps_since_drift_supervised <= drift_recency_window
+                or steps_since_drift_unsupervised <= drift_recency_window
+            )
+            recent_f1, recent_fpr = _recent_f1_fpr()
+            budget_frac = budget_remaining / budget_total
+
+            queried = False
+            updated = False
+            action = None
+            state = None
+            routed_to_rule = bool(matched_mask[i])
+
+            if routed_to_rule:
+                final_pred = int(rule_preds[i])
+            else:
+                state = controller.discretize_state(uncertainty, drift_flag_for_state, recent_f1, recent_fpr, budget_frac)
+                action = controller.select_action(state, budget_remaining)  # no label used
+
+                if action == ACTION_QUERY_AND_UPDATE and budget_remaining > 0:
+                    final_pred = 1 if p_attack >= decision_threshold else 0
+                    queried = True
+                elif action == ACTION_UPDATE_IF_DRIFT:
+                    final_pred = 1 if p_attack >= decision_threshold else 0
+                    if drift_flag_for_state and budget_remaining > 0:
+                        queried = True
+                elif action == ACTION_ADJUST_THRESHOLD:
+                    if not disable_threshold_adjustment:
+                        decision_threshold = min(0.9, decision_threshold + 0.05)
+                    final_pred = 1 if p_attack >= decision_threshold else 0
+                else:  # ACTION_NO_QUERY
+                    final_pred = 1 if p_attack >= decision_threshold else 0
+
+                if action != ACTION_ADJUST_THRESHOLD and decision_threshold > 0.5:
+                    decision_threshold = max(0.5, decision_threshold - 0.01)
+
+            # --- True label is read only from here on, and is only actually
+            # USED (for anything besides the evaluator's own final metrics,
+            # computed once at the very end from the full y_stream) when
+            # `queried` is True. ---
+            true_label = int(y_stream[i])
+            y_true_available = queried
+
+            classifier_updated = False
+            if (not routed_to_rule) and queried:
+                ml_model.learn_one(x_dict, true_label)
+                budget_remaining -= 1
+                updated = True
+                classifier_updated = True
+
+            recent_f1_fpr_updated = False
+            if (not routed_to_rule) and queried:
+                recent_true_queried.append(true_label)
+                recent_pred_queried.append(final_pred)
+                if len(recent_true_queried) > metrics_window:
+                    recent_true_queried.pop(0)
+                    recent_pred_queried.pop(0)
+                recent_f1_fpr_updated = True
+
+            # --- Drift detection: supervised detector only sees the true
+            # label when it was actually revealed; every other step instead
+            # feeds the always-available uncertainty signal to the
+            # unsupervised detector. Rule 8: supervised drift update is
+            # allowed only for queried/warm-up labels. ---
+            supervised_drift_updated = False
+            if queried:
+                error_indicator = float(ml_pred_monitor != true_label)
+                fired_sup = supervised_detector.update(error_indicator)
+                steps_since_drift_supervised = (
+                    0 if (fired_sup["adwin"] or fired_sup["page_hinkley"]) else steps_since_drift_supervised + 1
+                )
+                supervised_drift_updated = True
+            else:
+                steps_since_drift_supervised += 1  # decays recency only; no label used
+
+            fired_unsup = unsupervised_detector.update(uncertainty)
+            steps_since_drift_unsupervised = (
+                0 if (fired_unsup["adwin"] or fired_unsup["page_hinkley"]) else steps_since_drift_unsupervised + 1
+            )
+            unsupervised_drift_updated = True
+
+            supervised_reward_used = False
+            unsupervised_or_zero_reward_used = False
+            q_table_updated = False
+            if not routed_to_rule:
+                next_drift_flag = (
+                    steps_since_drift_supervised <= drift_recency_window
+                    or steps_since_drift_unsupervised <= drift_recency_window
+                )
+                next_recent_f1, next_recent_fpr = _recent_f1_fpr()
+                next_state = controller.discretize_state(
+                    uncertainty, next_drift_flag, next_recent_f1, next_recent_fpr, budget_remaining / budget_total,
+                )
+                if queried:
+                    reward = controller.compute_reward(true_label, final_pred, queried, updated)
+                    supervised_reward_used = True
+                else:
+                    reward = controller.compute_proxy_reward()
+                    unsupervised_or_zero_reward_used = True
+                controller.update(state, action, reward, next_state)
+                controller.decay_epsilon()
+                q_table_updated = True
+                action_trace.append({
+                    "sample_index": i,
+                    "state_uncertainty_bin": state[0],
+                    "state_drift_flag": state[1],
+                    "state_recent_f1_bin": state[2],
+                    "state_recent_fpr_bin": state[3],
+                    "state_budget_remaining_bin": state[4],
+                    "action": action,
+                    "queried": queried,
+                    "updated": updated,
+                    "predicted_label": final_pred,
+                    "true_label": true_label if queried else None,
+                    "reward": reward,
+                    "supervised_reward_used": supervised_reward_used,
+                    "budget_remaining": budget_remaining,
+                })
+
+            preds.append(final_pred)
+            queried_flags.append(queried)
+
+            trace_rows.append({
+                "stream_index": int(i),
+                "routed_to_rule_layer": routed_to_rule,
+                "routed_to_ml_layer": not routed_to_rule,
+                "y_true_available_to_algorithm": y_true_available,
+                "queried": queried,
+                "warmup_label": False,
+                "action": action,
+                "classifier_updated": classifier_updated,
+                "q_table_updated": q_table_updated,
+                "supervised_reward_used": supervised_reward_used,
+                "unsupervised_or_zero_reward_used": unsupervised_or_zero_reward_used,
+                "supervised_drift_updated": supervised_drift_updated,
+                "unsupervised_drift_updated": unsupervised_drift_updated,
+                "recent_f1_fpr_updated": recent_f1_fpr_updated,
+                "prediction": final_pred,
+                "final_metric_label_available_to_evaluator": True,
+                "uncertainty": float(uncertainty),
+                "recent_f1": float(recent_f1),
+                "recent_fpr": float(recent_fpr),
+                "decision_threshold": float(decision_threshold),
+                "drift_flag_for_state": bool(drift_flag_for_state),
+            })
+
+    # Evaluator-only step: uses the full true-label array to score
+    # predictions AFTER the run, exactly like run_rl_guided_hybrid and every
+    # other arm — this is the one place y_stream is used unconditionally,
+    # and it never feeds back into the algorithm above.
+    metrics = compute_metrics(y_stream[remaining_idx], preds)
+    coverage = float(np.mean(matched_mask))
+    precision, recall = rule_layer_precision_recall(matched_mask, rule_preds, y_stream)
+    result = ArmResult(
+        name="rl_guided_hybrid_strict_causal",
+        predictions=preds,
+        metrics=metrics,
+        train_time_sec=0.0,
+        inference_time_sec=infer_t["seconds"],
+        label_query_percentage=100.0 * sum(queried_flags) / n,
+        drift_count=supervised_detector.total_drift_count(),
+        rule_layer_coverage=coverage * 100,
+        ml_layer_coverage=(1 - coverage) * 100,
+        feedback_mode="budgeted_rl_controlled_strict_causal",
+        rule_precision=precision,
+        rule_recall=recall,
+        rule_layer_mode=rule_layer.describe(),
+        extra={
+            "rl_summary": controller.summary(),
+            "action_trace": action_trace,
+            "unsupervised_drift_count": unsupervised_detector.total_drift_count(),
+            "warmup_count": len(warmup_idx_set),
+            "supervised_drift_points": supervised_detector.drift_points(),
+            "unsupervised_drift_points": unsupervised_detector.drift_points(),
+        },
+    )
+    trace_df = pd.DataFrame(trace_rows)
+    return result, controller, trace_df
+
+
+# --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
 
@@ -717,36 +1186,23 @@ def run_hybrid_comparison(
     if not isinstance(budgets, list):
         budgets = [budgets]
 
-    combined_X = np.concatenate([X_train_chrono, X_test_chrono], axis=0)
-    combined_y = np.concatenate([y_train_chrono, y_test_chrono], axis=0)
-    combined_category = None
-    if category_train_chrono is not None and category_test_chrono is not None:
-        combined_category = np.concatenate([category_train_chrono, category_test_chrono], axis=0)
-
-    n_total = len(combined_X)
-    target_train = max(1, min(n_total - 1, int(round(n_total * rule_train_fraction))))
-    rng = np.random.default_rng(seed)
-    if combined_category is not None:
-        # Stratified by attack_cat, not a chronological prefix cut: CICIoT2023's
-        # combined stream is category-block-ordered, and with balanced_binary
-        # sampling the benign block alone can be tens of thousands of rows
-        # sorting right after a single tiny attack-category block — a plain
-        # prefix cut can then hand the rule/static-ML training set almost no
-        # attack diversity at all (observed: rule_only and static_ml_only both
-        # collapsed to F1 < 0.16 when the prefix happened to contain exactly
-        # one attack category). Stratifying guarantees every category
-        # contributes some training rows regardless of block order.
-        train_idx = _stratified_category_prefix_indices(combined_category, target_train, rng)
-    else:
-        # No category info (binary-only dataset) — stratify by binary label
-        # instead of a raw prefix, for the same reason.
-        train_idx = stratified_warmup_indices(combined_y, np.arange(n_total), target_train, rng, balanced=False)
-    train_idx_set = set(train_idx.tolist())
-    stream_idx = np.array([i for i in range(n_total) if i not in train_idx_set])
-
-    X_rule_train, y_rule_train = combined_X[train_idx], combined_y[train_idx]
-    X_stream, y_stream = combined_X[stream_idx], combined_y[stream_idx]
-    category_rule_train = combined_category[train_idx] if combined_category is not None else None
+    # Stratified by attack_cat (or binary label, if no category column
+    # exists), not a chronological prefix cut: CICIoT2023's combined stream
+    # is category-block-ordered, and with balanced_binary sampling the
+    # benign block alone can be tens of thousands of rows sorting right
+    # after a single tiny attack-category block — a plain prefix cut can
+    # then hand the rule/static-ML training set almost no attack diversity
+    # at all (observed: rule_only and static_ml_only both collapsed to
+    # F1 < 0.16 when the prefix happened to contain exactly one attack
+    # category). Stratifying guarantees every category contributes some
+    # training rows regardless of block order. See build_rule_train_stream_split.
+    split = build_rule_train_stream_split(
+        X_train_chrono, y_train_chrono, X_test_chrono, y_test_chrono,
+        rule_train_fraction, seed, category_train_chrono, category_test_chrono,
+    )
+    X_rule_train, y_rule_train = split["X_rule_train"], split["y_rule_train"]
+    X_stream, y_stream = split["X_stream"], split["y_stream"]
+    category_rule_train = split["category_rule_train"]
     logger.info(
         "Hybrid comparison: %d rows reserved for rule/static training, %d rows in the evaluation stream",
         len(X_rule_train), len(X_stream),
@@ -892,25 +1348,14 @@ def run_rl_reward_tuning(
     page_hinkley_threshold = drift_cfg.get("page_hinkley_threshold", 50)
     page_hinkley_min_instances = drift_cfg.get("page_hinkley_min_instances", 30)
 
-    combined_X = np.concatenate([X_train_chrono, X_test_chrono], axis=0)
-    combined_y = np.concatenate([y_train_chrono, y_test_chrono], axis=0)
-    combined_category = None
-    if category_train_chrono is not None and category_test_chrono is not None:
-        combined_category = np.concatenate([category_train_chrono, category_test_chrono], axis=0)
-
-    n_total = len(combined_X)
-    target_train = max(1, min(n_total - 1, int(round(n_total * rule_train_fraction))))
+    split = build_rule_train_stream_split(
+        X_train_chrono, y_train_chrono, X_test_chrono, y_test_chrono,
+        rule_train_fraction, seed, category_train_chrono, category_test_chrono,
+    )
+    X_rule_train, y_rule_train = split["X_rule_train"], split["y_rule_train"]
+    X_stream, y_stream = split["X_stream"], split["y_stream"]
+    category_rule_train = split["category_rule_train"]
     rng = np.random.default_rng(seed)
-    if combined_category is not None:
-        train_idx = _stratified_category_prefix_indices(combined_category, target_train, rng)
-    else:
-        train_idx = stratified_warmup_indices(combined_y, np.arange(n_total), target_train, rng, balanced=False)
-    train_idx_set = set(train_idx.tolist())
-    stream_idx = np.array([i for i in range(n_total) if i not in train_idx_set])
-
-    X_rule_train, y_rule_train = combined_X[train_idx], combined_y[train_idx]
-    X_stream, y_stream = combined_X[stream_idx], combined_y[stream_idx]
-    category_rule_train = combined_category[train_idx] if combined_category is not None else None
 
     rule_layer = RuleBasedLayer(
         confidence_threshold=confidence_threshold, random_state=seed, known_categories_top_k=known_categories_top_k,

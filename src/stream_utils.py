@@ -174,6 +174,10 @@ class BudgetedStreamResult:
     drift_points: list[dict[str, Any]]
     queried_attack_count: int = field(init=False, default=0)
     queried_benign_count: int = field(init=False, default=0)
+    # Only populated when strict_causal=True: drift events from the
+    # always-on unsupervised (label-free) detector, kept separate from
+    # `drift_count` (which is then the supervised, query-gated count).
+    unsupervised_drift_count: int = 0
 
     def __post_init__(self) -> None:
         self.queried_attack_count = sum(1 for v in self.queried_labels if v == 1)
@@ -199,6 +203,7 @@ def run_budgeted_stream(
     rule_matched_mask: np.ndarray | None = None,
     rule_preds: np.ndarray | None = None,
     seed: int = 42,
+    strict_causal: bool = False,
 ) -> tuple[BudgetedStreamResult, Any]:
     """Run one label-budgeted online-learning strategy over a stream, with a
     warm-up phase and batch-wise top-k query selection so the budget is
@@ -220,6 +225,22 @@ def run_budgeted_stream(
     chronological order.
 
     strategy: "random" | "uncertainty" | "drift_triggered_uncertainty"
+
+    strict_causal: when False (default — the original, archived-results
+    behavior), the supervised drift detector is updated with the true-label
+    error indicator on EVERY stream sample regardless of whether that
+    sample's label was queried, and the rolling-F1 window is likewise built
+    from every sample's true label. That is a simplifying benchmarking
+    assumption, not a real deployment constraint: a real system with only a
+    label-query budget would never observe the true label for an unqueried
+    sample. When True, the true label is used for detector/window updates
+    ONLY on steps where it was actually revealed (queried or warm-up); every
+    other step instead feeds an always-available unsupervised signal
+    (prediction uncertainty) into a second, independent drift detector, so
+    drift is still monitored end-to-end without ever touching a hidden
+    label. See run_budgeted_stream's `_post_sample` closure below and
+    src/hybrid_ids.py's run_rl_guided_hybrid_strict_causal for the sibling
+    implementation used by the RL-guided arm.
     """
     if strategy not in {"random", "uncertainty", "drift_triggered_uncertainty"}:
         raise ValueError(f"Unknown strategy: {strategy}")
@@ -234,6 +255,16 @@ def run_budgeted_stream(
     detector = DriftDetector(
         detector_type=detector_type, adwin_delta=adwin_delta,
         page_hinkley_threshold=page_hinkley_threshold, page_hinkley_min_instances=page_hinkley_min_instances,
+    )
+    # Strict-causal only: a second, independent detector fed an unsupervised
+    # signal (prediction uncertainty) on every step whose label was NOT
+    # revealed — see the strict_causal docstring paragraph above.
+    unsupervised_detector = (
+        DriftDetector(
+            detector_type=detector_type, adwin_delta=adwin_delta,
+            page_hinkley_threshold=page_hinkley_threshold, page_hinkley_min_instances=page_hinkley_min_instances,
+        )
+        if strict_causal else None
     )
     rng = np.random.default_rng(seed)
 
@@ -268,12 +299,24 @@ def run_budgeted_stream(
             final_pred = ml_pred
         return x_dict, final_pred, ml_pred, uncertainty
 
-    def _post_sample(i: int, x_dict: dict, final_pred: int, ml_pred: int, queried: bool) -> None:
+    def _post_sample(
+        i: int, x_dict: dict, final_pred: int, ml_pred: int, queried: bool, uncertainty: float = 0.0,
+    ) -> None:
         nonlocal steps_since_drift, n_evaluated
         true_label = int(y[i])  # true label only used from here on (post decision)
-        error_indicator = float(ml_pred != true_label)
-        fired = detector.update(error_indicator)
-        steps_since_drift = 0 if (fired["adwin"] or fired["page_hinkley"]) else steps_since_drift + 1
+        # In non-strict mode, every sample's label is treated as available
+        # for detector/window bookkeeping (the original, archived behavior).
+        # In strict_causal mode, that's only true when the label was
+        # actually revealed this step (queried); every other step falls
+        # back to the unsupervised detector fed with uncertainty only.
+        label_available = queried or not strict_causal
+        if label_available:
+            error_indicator = float(ml_pred != true_label)
+            fired = detector.update(error_indicator)
+            steps_since_drift = 0 if (fired["adwin"] or fired["page_hinkley"]) else steps_since_drift + 1
+        else:
+            fired_unsup = unsupervised_detector.update(uncertainty)
+            steps_since_drift = 0 if (fired_unsup["adwin"] or fired_unsup["page_hinkley"]) else steps_since_drift + 1
 
         preds.append(final_pred)
         if queried:
@@ -283,14 +326,15 @@ def run_budgeted_stream(
         else:
             query_flags.append(False)
 
-        window_true.append(true_label)
-        window_pred.append(final_pred)
-        if len(window_true) > window_size:
-            window_true.pop(0)
-            window_pred.pop(0)
+        if label_available:
+            window_true.append(true_label)
+            window_pred.append(final_pred)
+            if len(window_true) > window_size:
+                window_true.pop(0)
+                window_pred.pop(0)
         n_evaluated += 1
         if n_evaluated % window_size == 0 or i == n - 1:
-            rolling_f1.append(f1_score(window_true, window_pred, zero_division=0))
+            rolling_f1.append(f1_score(window_true, window_pred, zero_division=0) if window_true else 0.0)
 
     # --- Warm-up: train-only on the stratified seed set (order doesn't
     # affect drift/rolling-F1 bookkeeping since these rows never reach
@@ -348,11 +392,11 @@ def run_budgeted_stream(
         selected_set = set(int(s) for s in selected)
 
         for offset, j in enumerate(idxs):
-            x_dict, final_pred, ml_pred, _ = batch_info[offset]
+            x_dict, final_pred, ml_pred, unc = batch_info[offset]
             queried = offset in selected_set and budget_remaining > 0
             if queried:
                 budget_remaining -= 1
-            _post_sample(j, x_dict, final_pred, ml_pred, queried=queried)
+            _post_sample(j, x_dict, final_pred, ml_pred, queried=queried, uncertainty=unc)
 
         pos += batch_size
 
@@ -367,4 +411,6 @@ def run_budgeted_stream(
         drift_count=detector.total_drift_count(),
         drift_points=detector.drift_points(),
     )
+    if strict_causal:
+        result.unsupervised_drift_count = unsupervised_detector.total_drift_count()
     return result, model

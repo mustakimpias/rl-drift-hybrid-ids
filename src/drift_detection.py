@@ -25,7 +25,20 @@ class DriftEvent:
 
 
 class DriftDetector:
-    """Wraps one or more river drift detectors over an error-indicator stream."""
+    """Wraps one or more river drift detectors over a scalar signal stream.
+
+    Signal-agnostic by design: feeding it a 0/1 prediction-error indicator
+    (requires the true label — "supervised drift detection") and feeding it
+    an unsupervised per-sample signal such as predictive uncertainty,
+    probability margin, or confidence (no label required — "unsupervised
+    drift detection") both work through the same `update()` call. The
+    strict-causal experiment path (see src/hybrid_ids.py
+    run_rl_guided_hybrid_strict_causal) relies on this: it runs two
+    independent DriftDetector instances, one fed an error indicator only on
+    steps where a label was actually revealed (queried/warm-up), and one fed
+    an unsupervised uncertainty signal on every step regardless of query
+    decision, so drift monitoring never silently depends on a hidden label.
+    """
 
     def __init__(
         self,
