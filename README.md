@@ -1,10 +1,13 @@
 # Adaptive Machine Learning for Intrusion Detection: Overcoming the Limitations of Rule-Based Systems
 
-**Framework:** Cost-Sensitive RL-Guided Drift-Triggered Active Learning Hybrid IDS
+**Framework:** Strict-Causal Drift-Triggered Active Learning Hybrid IDS with an exploratory RL-guided diagnostic extension.
 
-This repository contains code, configuration files, scripts, and thesis-ready
-artifacts for an MSc thesis on label-efficient adaptive intrusion detection
-using drift-triggered active learning and a lightweight RL controller.
+This repository contains code, configuration files, and scripts for an MSc
+thesis on strict-causal, label-efficient adaptive intrusion detection. The
+main evaluated method is a Strict-Causal Drift-Triggered Active Learning
+Hybrid IDS. The RL-guided controller is retained as an exploratory
+diagnostic extension and negative-result analysis under strict causal
+feedback.
 
 The pipeline combines:
 
@@ -19,15 +22,66 @@ The pipeline combines:
 4. **Active learning** strategies (random / uncertainty / drift-triggered
    uncertainty) that spend a limited label budget selectively, via a
    warm-up + batch-wise top-k query engine shared with the hybrid arms.
-5. A **lightweight RL-lite controller** — tabular Q-learning over a small
-   discretized state space (uncertainty, drift status, recent F1, recent
-   FPR, remaining label budget) — that decides, per sample: query a label
-   and update the model, update only if drift was detected, adjust the
-   decision threshold conservatively, or do nothing. This is a decision
-   policy, **not** the IDS classifier, and it never sees a sample's true
-   label before choosing an action — only afterward, for reward bookkeeping.
+   The **drift-triggered active-learning hybrid is the thesis's main
+   proposed method**, evaluated under the strict-causal protocol described
+   below.
+5. An **exploratory lightweight RL controller used for diagnostic
+   analysis.** Under the strict-causal protocol, this controller is not the
+   main proposed method; it is retained to show the limitations of coarse
+   tabular RL under sparse causal feedback. Technically it is a tabular
+   Q-learning-lite agent over a small discretized state space (uncertainty,
+   drift status, recent F1, recent FPR, remaining label budget) that
+   decides, per sample: query a label and update the model, update only if
+   drift was detected, adjust the decision threshold conservatively, or do
+   nothing. It never sees a sample's true label before choosing an action —
+   and, under the strict-causal protocol, it only sees that label
+   afterward if the sample was actually queried.
 
 No deep RL / DQN is used anywhere in this project, by design.
+
+## Strict-causal protocol and results
+
+An earlier implementation of the RL-guided controller computed its drift
+detector, reward, and rolling performance state from every stream sample's
+true label, regardless of whether that label had actually been queried
+under the stated label budget. That run reported an F1 improvement from
+0.8849 to 0.9383 while "querying" only 4.4675% of labels (a ~95.5% label
+saving) — those numbers are **archived, oracle-feedback results**, not a
+label-budget-constrained result, and must not be cited as current
+strict-causal findings. They are preserved on disk only for
+before/after comparison, never as headline claims.
+
+The repository now also includes a **strict-causal corrected pipeline**
+(`scripts/run_strict_causal_experiment.py`, `run_strict_causal_diagnostics.py`,
+`generate_strict_causal_figures.py`, `generate_strict_causal_thesis_table.py`)
+in which the classifier, the drift detector, the reward computation, and
+every rolling state feature may only use a sample's true label at the exact
+step that label is queried (or during an initial warm-up seed set) — never
+before, and never for a sample that was not queried. The evaluator is still
+free to use every ground-truth label, but only after the full run, to
+compute final metrics.
+
+Under this corrected protocol, on the balanced CICIoT2023 stream:
+
+- The **drift-triggered active-learning hybrid** (the thesis's main
+  method) reaches F1 = 0.9379 (macro-F1 = 0.9413, FPR = 0.00086) at a 25%
+  label budget — a 75% label saving relative to full feedback.
+- The **RL-guided controller**, evaluated as an exploratory diagnostic
+  extension under the identical protocol, reaches only F1 = 0.7161 at a
+  matched 25% budget, and needs roughly 74% of the stream's labels to
+  approach its earlier (non-causal) reported performance. This negative
+  result is retained specifically to document how coarse tabular RL can
+  fail under sparse causal feedback — it is not evidence for RL as the
+  main method.
+
+Results under this corrected protocol live in `results_ciciot2023_strict_causal/`
+and are the **thesis-facing results**; results under the earlier pipeline
+live in `results_ciciot2023_balanced_test/` and are retained strictly as an
+archived/oracle-feedback comparison. Any reward-sensitivity configuration
+selected via the sweep in `rl_reward_tuning.csv` was tuned on the same
+stream used for final evaluation, not an independent validation stream —
+this is a separate, still-open limitation, not something the strict-causal
+correction resolves.
 
 ## Datasets
 
@@ -216,13 +270,18 @@ can be checked in isolation without cross-referencing the report.
 - Order matters for the streaming/drift/active-learning/hybrid experiments:
   `preprocess_pipeline()` produces both a shuffled stratified split (for
   batch baselines) and a chronological split (for everything stream-based).
-- The drift detector's error signal uses ground-truth labels available in
-  this offline simulation (standard practice for benchmarking detector
-  behavior). This is separate from — and does not spend — the
-  active-learning label budget, which only tracks labels actually used to
-  update the model. The RL controller's action selection and the
-  active-learning query decisions never see a sample's true label before
-  that decision is made — only the reward/model-update step afterward does.
+- In the original/archived pipeline (`run_rl_hybrid_experiment.py`,
+  `run_active_learning.py`), the drift detector's error signal uses
+  ground-truth labels for every sample, not only queried ones — this is why
+  those results are reported as archived/oracle-feedback, not strict-causal
+  (see "Strict-causal protocol and results" above). The strict-causal
+  pipeline (`run_strict_causal_experiment.py`) instead gates the supervised
+  drift detector, reward, and rolling-state updates on the same query
+  decision as the classifier, and falls back to an unsupervised
+  (label-free) drift signal for unqueried samples. In both pipelines, action
+  selection and query decisions never see a sample's true label before that
+  decision is made — only afterward, and only strict-causal treats "only
+  afterward" as "only if queried."
 - The RL controller is intentionally a tabular Q-learning-lite agent, not a
   deep RL agent, per the thesis scope.
 - Cross-dataset validation (`scripts/run_cross_dataset.py`) trains on one
@@ -246,9 +305,8 @@ can be checked in isolation without cross-referencing the report.
 
 ## Updating this repository
 
-See `GITHUB_UPDATE_COMMANDS.md` for the safe day-to-day workflow (and
-`push_update.ps1` / `push_update.bat` for a scripted version of it) — in
-short:
+`push_update.ps1` / `push_update.bat` give a scripted version of the safe
+day-to-day workflow below:
 
 ```bash
 git status
