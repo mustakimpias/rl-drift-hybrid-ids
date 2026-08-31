@@ -177,6 +177,20 @@ class RLController:
             self.update_count += 1
         return r
 
+    def compute_proxy_reward(self) -> float:
+        """Neutral reward used in the strict-causal protocol when a sample's
+        true label was NOT queried this step: compute_reward() cannot be
+        called (it requires true_label, which is unavailable), but a
+        Q-learning transition is still recorded so the controller keeps
+        learning about state visitation and epsilon-greedy exploration
+        continues to behave normally. Always returns 0.0 — deliberately not
+        derived from true_label, prediction correctness, or any other
+        oracle signal. See run_rl_guided_hybrid_strict_causal for the caller
+        that gates on the query decision to choose between this and
+        compute_reward().
+        """
+        return 0.0
+
     def update(self, state: State, action: int, reward: float, next_state: State) -> None:
         """Standard tabular Q-learning update rule."""
         best_next = np.max(self.q_table[next_state])
